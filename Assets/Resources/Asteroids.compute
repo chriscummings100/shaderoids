@@ -1,14 +1,207 @@
-﻿// Each #kernel tells which function to compile; you can have many kernels
-#pragma kernel CSMain
+﻿#pragma kernel ClearLines
+#pragma kernel GenerateTestLines
+#pragma kernel LineDispatchArgs
+#pragma kernel UpdateAndDrawPlayer
 
-// Create a RenderTexture with enableRandomWrite flag and set it
-// with cs.SetTexture
-RWTexture2D<float4> Result;
+//structures
+struct Line {
+    float2 a;
+    float2 b;
+};
+struct Counters {
+    int numLines;
+};
+struct KeyState {
+    int down;
+    int pressed;
+    int released;
+};
+struct PlayerState {
+    float2 position;
+    float rotation;
+    float2 velocity;
+    bool alive;
+};
 
-[numthreads(8,8,1)]
-void CSMain (uint3 id : SV_DispatchThreadID)
+//special key codes (that aren't just ascii codes)
+const int KEY_ESCAPE = 0;
+
+//buffers
+RWStructuredBuffer<Line> _linesRW;
+RWStructuredBuffer<Counters> _counters;
+RWStructuredBuffer<uint> _dispatch;
+StructuredBuffer<KeyState> _keyStates;
+RWStructuredBuffer<PlayerState> _playersRW;
+
+//general use uniform to limit dispatch thread counts
+int _threadCount;
+
+//time step and time from unity
+float _timeStep;
+float _time;
+int _frame;
+
+//single dispatch to reset line counter
+[numthreads(1,1,1)]
+void ClearLines(uint3 id : SV_DispatchThreadID)
 {
-	// TODO: insert actual code here!
+    _counters[0].numLines = 0;
+}
 
-	Result[id.xy] = float4(id.x & id.y, (id.x & 15)/15.0, (id.y & 15)/15.0, 0.0);
+//creates lines based on dispatch thread
+[numthreads(256, 1, 1)]
+void GenerateTestLines(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _threadCount)
+    {
+        //allocate space
+        int lineIdx;
+        InterlockedAdd(_counters[0].numLines, 1, lineIdx);
+
+        //build line
+        Line l;
+        float ang = radians(id.x*2);
+        float3 dir = float3(sin(ang), cos(ang), 0);
+        l.a = float2(1024, 768) * 0.5;
+        l.b = float2(1024,768) * 0.5 + dir * 0.5 * 768;
+        _linesRW[lineIdx] = l;
+    }
+}
+
+//fills out indirect dispatch args 
+[numthreads(1, 1, 1)]
+void LineDispatchArgs(uint3 id : SV_DispatchThreadID)
+{
+    _dispatch[0] = _counters[0].numLines*2; //v count per inst (2 verts per line)
+    _dispatch[1] = 1; //1 instance
+    _dispatch[2] = 0; //verts start at 0
+    _dispatch[3] = 0; //instances start at 0
+}
+
+int AllocLines(int count) {
+    int lineIdx;
+    InterlockedAdd(_counters[0].numLines, count, lineIdx);
+    return lineIdx;
+}
+void AddLine(int idx, float2 a, float2 b) {
+    _linesRW[idx].a = a;
+    _linesRW[idx].b = b;
+}
+
+float2 mulpoint(float3x3 trans, float2 p) {
+    return mul(trans, float3(p, 1)).xy;
+}
+float2 mulvec(float3x3 trans, float2 p) {
+    return mul(trans, float3(p, 0)).xy;
+}
+
+//some random functions
+uint wang_hash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+float wang_rand(uint seed)
+{
+    uint res = wang_hash(seed);
+    float rf = (res % 256);
+    return rf / 255;
+}
+float wang_rand(float val)
+{
+    uint hash_val = (uint)(val * 100);
+    uint res = wang_hash(hash_val);
+    float rf = (res % 256);
+    return rf / 255;
+}
+float permute(float2 val)
+{
+    return wang_rand(val.y + wang_rand(val.x));
+}
+float permute(float3 val)
+{
+    return wang_rand(val.z + wang_rand(val.y + wang_rand(val.x)));
+}
+
+//updates player movement and outputs draw request
+[numthreads(256, 1, 1)]
+void UpdateAndDrawPlayer(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _threadCount)
+    {
+        PlayerState player = _playersRW[id.x];
+        if(player.alive) {
+            float rot = 0;
+            float thrust = 0;
+            float rotPerSecond = 5;
+            float thrustPerSecond = 150;
+
+            if (_keyStates['a'].down) {
+                rot -= rotPerSecond * _timeStep;
+            }
+            if (_keyStates['d'].down) {
+                rot += rotPerSecond * _timeStep;
+            }
+            if (_keyStates['w'].down) {
+                thrust += thrustPerSecond * _timeStep;
+            }
+            if (_keyStates['r'].down) { //handy debug reset
+                player.velocity = 0;
+                player.position = float2(1024, 768)*0.5f;
+                player.rotation = 0;
+            }
+
+            //wrap player (note: better version should handle overshoot amount)
+            player.position = player.position >= 0 ? player.position : float2(1024, 768);
+            player.position = player.position <= float2(1024,768) ? player.position  : 0;
+
+            player.rotation += rot;
+
+            float2 worldy = float2(sin(player.rotation), cos(player.rotation));
+            float2 worldx = float2(-worldy.y, worldy.x);
+
+            player.velocity += worldy * thrust;
+            player.position += player.velocity * _timeStep;
+
+            float scl = 12;
+            //float scl = 50;
+
+            worldx *= scl;
+            worldy *= scl;
+            float3x3 trans = {
+                worldx.x, worldy.x, player.position.x,
+                worldx.y, worldy.y, player.position.y,
+                0, 0, 1
+            };
+
+            int lineIdx = AllocLines(5);
+            
+            float2 leftcorner = mulpoint(trans, float2(-0.7, -1));
+            float2 rightcorner = mulpoint(trans, float2(0.7, -1));
+            float2 tip = mulpoint(trans, float2(0, 1));
+            float2 leftback = mulpoint(trans, float2(-0.3, -0.7f));
+            float2 rightback = mulpoint(trans, float2(0.3, -0.7f));
+
+            AddLine(lineIdx++, leftcorner, tip);
+            AddLine(lineIdx++, rightcorner, tip);
+            AddLine(lineIdx++, leftcorner, leftback);
+            AddLine(lineIdx++, rightcorner, rightback);
+            AddLine(lineIdx++, leftback, rightback);
+
+            int thrustframe = (_frame / 4);
+            if (thrust > 0 && (thrustframe &1)) {
+                lineIdx = AllocLines(2);
+                float2 thrustback = mulpoint(trans, float2(0.0f, -1.5f-wang_rand(thrustframe)*0.15f));
+                AddLine(lineIdx++, leftback, thrustback);
+                AddLine(lineIdx++, rightback, thrustback);
+            }
+             
+        }
+        _playersRW[id.x] = player;
+
+    }
 }

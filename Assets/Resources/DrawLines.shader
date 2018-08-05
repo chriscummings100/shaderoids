@@ -20,18 +20,23 @@
 			};
 
             struct Line {
-                float3 a;
-                float3 b;
+                float2 a;
+                float2 b;
             };
 
             StructuredBuffer<Line> lines;
+            
 			
 			v2f vert (uint id : SV_VertexID, uint inst : SV_InstanceID)
 			{
                 Line l = lines[id / 2];
-                float3 p = (id & 1) ? l.a : l.b;
+                float2 p = (id & 1) ? l.a : l.b;
+
+                //adjust from 0:768 to -1:1
+                p = 2 * (p - float2(1024,768)*0.5) / float2(1024,768);
+                
 				v2f o;
-                o.vertex = float4(p, 1);
+                o.vertex = float4(p, 0, 1);
 				return o;
 			}
 			
