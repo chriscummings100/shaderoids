@@ -1,7 +1,11 @@
-﻿#pragma kernel ClearLines
+﻿#pragma kernel BeginFrame
 #pragma kernel GenerateTestLines
 #pragma kernel LineDispatchArgs
 #pragma kernel UpdateAndDrawPlayer
+#pragma kernel UpdateAndDrawAsteroid
+#pragma kernel UpdateAndDrawBullet
+#pragma kernel CollidePlayerAsteroid
+#pragma kernel CollideBulletAsteroid
 
 //structures
 struct Line {
@@ -10,6 +14,9 @@ struct Line {
 };
 struct Counters {
     int numLines;
+    int nextBullet;
+    int nextAsteroid;
+    int numSoundRequests;
 };
 struct KeyState {
     int down;
@@ -20,7 +27,23 @@ struct PlayerState {
     float2 position;
     float rotation;
     float2 velocity;
-    bool alive;
+    int alive;
+};
+struct AsteroidState {
+    float2 position;
+    float rotation;
+    float2 velocity;
+    int alive;
+    float radius;
+    int level;
+};
+struct BulletState {
+    float2 position;
+    float2 velocity;
+    float lifetime;
+};
+struct SoundRequest {
+    int id;
 };
 
 //special key codes (that aren't just ascii codes)
@@ -32,6 +55,9 @@ RWStructuredBuffer<Counters> _counters;
 RWStructuredBuffer<uint> _dispatch;
 StructuredBuffer<KeyState> _keyStates;
 RWStructuredBuffer<PlayerState> _playersRW;
+RWStructuredBuffer<AsteroidState> _asteroidsRW;
+RWStructuredBuffer<BulletState> _bulletsRW;
+RWStructuredBuffer<SoundRequest> _soundRequestsRW;
 
 //general use uniform to limit dispatch thread counts
 int _threadCount;
@@ -41,11 +67,18 @@ float _timeStep;
 float _time;
 int _frame;
 
+//buffer info
+int _maxBullets;
+int _maxAsteroids;
+int _maxPlayers;
+int _maxSoundRequests;
+
 //single dispatch to reset line counter
 [numthreads(1,1,1)]
-void ClearLines(uint3 id : SV_DispatchThreadID)
+void BeginFrame(uint3 id : SV_DispatchThreadID)
 {
     _counters[0].numLines = 0;
+    _counters[0].numSoundRequests = 0;
 }
 
 //creates lines based on dispatch thread
@@ -86,6 +119,14 @@ int AllocLines(int count) {
 void AddLine(int idx, float2 a, float2 b) {
     _linesRW[idx].a = a;
     _linesRW[idx].b = b;
+}
+
+void RequestSound(int id) {
+    int idx;
+    InterlockedAdd(_counters[0].numSoundRequests, 1, idx);
+    if (idx < _maxSoundRequests) {
+        _soundRequestsRW[idx].id = id;
+    }
 }
 
 float2 mulpoint(float3x3 trans, float2 p) {
@@ -149,7 +190,7 @@ void UpdateAndDrawPlayer(uint3 id : SV_DispatchThreadID)
             if (_keyStates['w'].down) {
                 thrust += thrustPerSecond * _timeStep;
             }
-            if (_keyStates['r'].down) { //handy debug reset
+            if (_keyStates['r'].pressed) { //handy debug reset
                 player.velocity = 0;
                 player.position = float2(1024, 768)*0.5f;
                 player.rotation = 0;
@@ -158,7 +199,6 @@ void UpdateAndDrawPlayer(uint3 id : SV_DispatchThreadID)
             //wrap player (note: better version should handle overshoot amount)
             player.position = player.position >= 0 ? player.position : float2(1024, 768);
             player.position = player.position <= float2(1024,768) ? player.position  : 0;
-
             player.rotation += rot;
 
             float2 worldy = float2(sin(player.rotation), cos(player.rotation));
@@ -166,6 +206,17 @@ void UpdateAndDrawPlayer(uint3 id : SV_DispatchThreadID)
 
             player.velocity += worldy * thrust;
             player.position += player.velocity * _timeStep;
+
+            if (_keyStates[' '].pressed) {
+                int nextBullet;
+                InterlockedAdd(_counters[0].nextBullet, 1, nextBullet);
+                BulletState b;
+                b.position = player.position;
+                b.velocity = worldy * 1000;
+                b.lifetime = 3;
+                _bulletsRW[nextBullet%_maxBullets] = b;
+            }
+
 
             float scl = 12;
             //float scl = 50;
@@ -198,10 +249,193 @@ void UpdateAndDrawPlayer(uint3 id : SV_DispatchThreadID)
                 float2 thrustback = mulpoint(trans, float2(0.0f, -1.5f-wang_rand(thrustframe)*0.15f));
                 AddLine(lineIdx++, leftback, thrustback);
                 AddLine(lineIdx++, rightback, thrustback);
-            }
-             
+            }             
         }
         _playersRW[id.x] = player;
+    }
+}
 
+//updates player movement and outputs draw request
+[numthreads(256, 1, 1)]
+void UpdateAndDrawAsteroid(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _threadCount)
+    {
+        AsteroidState asteroid = _asteroidsRW[id.x];
+        if (asteroid.alive) {
+
+            asteroid.position += asteroid.velocity * _timeStep;
+            asteroid.position = asteroid.position >= 0 ? asteroid.position : float2(1024, 768);
+            asteroid.position = asteroid.position <= float2(1024, 768) ? asteroid.position : 0;
+
+            float scl = asteroid.radius;
+
+            float2 worldy = float2(sin(asteroid.rotation), cos(asteroid.rotation));
+            float2 worldx = float2(-worldy.y, worldy.x);
+            worldx *= scl;
+            worldy *= scl;
+            float3x3 trans = {
+                worldx.x, worldy.x, asteroid.position.x,
+                worldx.y, worldy.y, asteroid.position.y,
+                0, 0, 1
+            };
+
+            //alloc edges
+            const int NUM_EDGES = 9;
+            int lineIdx = AllocLines(NUM_EDGES);
+
+            //build first point then start iterating
+            float randscl = 0.75f;
+            float2 first;
+            {
+                int i = 0;
+                float ang = 0;
+                float2 pos = float2(sin(ang), cos(ang));
+                pos += randscl * float2(wang_rand(id.x*NUM_EDGES + i), wang_rand(id.x*NUM_EDGES * 2 + i));
+                first = mulpoint(trans, pos);
+            }
+            float2 prev = first;
+            for (int i = 1; i < NUM_EDGES; i++) {
+
+                //offset every other point using random number
+                float ang = (i*3.1415927f*2.0f) / NUM_EDGES;
+                float2 pos = float2(sin(ang), cos(ang));
+                pos += randscl * float2(wang_rand(id.x*NUM_EDGES + i), wang_rand(id.x*NUM_EDGES * 2 + i));
+
+                //add new line
+                float2 curr = mulpoint(trans, pos);
+                AddLine(lineIdx++, prev, curr); 
+                prev = curr;
+            }
+
+            //add final line to joinn previous point to first point
+            AddLine(lineIdx++, prev, first);
+
+        }
+        _asteroidsRW[id.x] = asteroid;
+    }
+}
+
+//updates player movement and outputs draw request
+[numthreads(256, 1, 1)]
+void UpdateAndDrawBullet(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _threadCount)
+    {
+        BulletState bullet = _bulletsRW[id.x];
+        if (bullet.lifetime > 0) {
+
+            bullet.position += bullet.velocity * _timeStep;
+            if (any(bullet.position < 0) || any(bullet.position > float2(1024, 768))) {
+                bullet.lifetime = -1;
+                return;
+            }
+            bullet.lifetime -= _timeStep;
+
+            float scl = 2;
+            float3x3 trans = {
+                scl, 0, bullet.position.x,
+                0, scl, bullet.position.y, 
+                0, 0, 1
+            };
+
+            //alloc edges
+            const int NUM_EDGES = 6;
+            int lineIdx = AllocLines(NUM_EDGES);
+
+            //build first point then start iterating
+            float2 first;
+            {
+                int i = 0;
+                float ang = 0;
+                float2 pos = float2(sin(ang), cos(ang));
+                first = mulpoint(trans, pos);
+            }
+            float2 prev = first;
+            for (int i = 1; i < NUM_EDGES; i++) {
+
+                float ang = (i*3.1415927f*2.0f) / NUM_EDGES;
+                float2 pos = float2(sin(ang), cos(ang));
+                float2 curr = mulpoint(trans, pos);
+                AddLine(lineIdx++, prev, curr);
+                prev = curr;
+            }
+
+            //add final line to joinn previous point to first point
+            AddLine(lineIdx++, prev, first);
+
+        }
+        _bulletsRW[id.x] = bullet;
+    }
+}
+
+void SplitAsteroid(int idx) {
+    int nextIndex;
+    InterlockedAdd(_counters[0].nextAsteroid, 2, nextIndex);
+
+    AsteroidState asteroid = _asteroidsRW[idx];
+    if (asteroid.level < 2) {
+
+        float childSpeed = 50; 
+
+        AsteroidState child;
+        child.position = asteroid.position;
+        child.velocity = asteroid.velocity + (float2(wang_rand(nextIndex), wang_rand(nextIndex * 2)) * 2 - 1) * childSpeed;
+        child.alive = 1;
+        child.radius = asteroid.radius * 0.5;
+        child.rotation = (wang_rand(nextIndex * 3) * 2 - 1) * 3.1415927f;
+        child.level = asteroid.level + 1;
+        _asteroidsRW[nextIndex++] = child;
+
+        child.position = asteroid.position;
+        child.velocity = asteroid.velocity + (float2(wang_rand(nextIndex), wang_rand(nextIndex * 2)) * 2 - 1) * childSpeed;
+        child.alive = 1;
+        child.radius = asteroid.radius * 0.5;
+        child.rotation = (wang_rand(nextIndex * 3) * 2 - 1) * 3.1415927f;
+        child.level = asteroid.level + 1;
+        _asteroidsRW[nextIndex++] = child;
+    }
+
+
+    _asteroidsRW[idx].alive = 0;
+}
+
+[numthreads(256, 1, 1)]  
+void CollidePlayerAsteroid(uint3 id : SV_DispatchThreadID) 
+{
+    if (id.x < _threadCount)
+    {
+        int playerIdx = id.x / _maxAsteroids;
+        int asteroidIdx = id.x - (playerIdx*_maxAsteroids);
+
+        PlayerState player = _playersRW[playerIdx];
+        AsteroidState asteroid = _asteroidsRW[asteroidIdx];
+
+        if (player.alive && asteroid.alive) {
+            if (length(player.position - asteroid.position) < (asteroid.radius+10)) {
+                _playersRW[playerIdx].alive = 0;
+                _asteroidsRW[asteroidIdx].alive = 0;
+            }
+        }
+    }
+}
+
+[numthreads(256, 1, 1)]
+void CollideBulletAsteroid(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _threadCount)
+    {
+        int bulletIdx = id.x / _maxAsteroids;
+        int asteroidIdx = id.x - (bulletIdx*_maxAsteroids);
+
+        BulletState bullet = _bulletsRW[bulletIdx];
+        AsteroidState asteroid = _asteroidsRW[asteroidIdx];
+
+        if (bullet.lifetime > 0 && asteroid.alive) {
+            if (length(bullet.position - asteroid.position) < (asteroid.radius + 2)) {
+                _bulletsRW[bulletIdx].lifetime = -1;
+                SplitAsteroid(asteroidIdx);
+            }
+        }
     }
 }
