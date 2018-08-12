@@ -30,6 +30,12 @@ public class Game : MonoBehaviour
 
         public int requestClearAsteroids;
         public int requestSpawnAsteroids;
+
+        public int liveAsteroids;
+        public int level;
+
+        public float totalLeveltime;
+        public float lastBlopTime;
     }
     public struct KeyState {
         public int down;
@@ -41,7 +47,10 @@ public class Game : MonoBehaviour
         public float rotation;
         public Vector2 velocity;
         public int alive;
-        public int waitingToSpawn;
+        public int wantsToSpawn;
+        public int canSpawn;
+        public int lives;
+        public int score;
     }
     public struct AsteroidState {
         public Vector2 position;
@@ -96,7 +105,6 @@ public class Game : MonoBehaviour
     const int KEY_ESCAPE = 0;
 
     int kernelBeginFrame;
-    int kernelGenerateTestLines;
     int kernelDrawDispatchArgs;
     int kernelUpdateAndDrawPlayer;
     int kernelUpdateAndDrawAsteroid;
@@ -104,20 +112,24 @@ public class Game : MonoBehaviour
     int kernelCollidePlayerAsteroid;
     int kernelCollideBulletAsteroid;
     int kernelBuildFont;
-    int kernelDrawFont;
     int kernelUpdateGame;
     int kernelSetupDispatch;
     int kernelSpawnAsteroids;
     int kernelClearAsteroids;
+    int kernelPreparePlayerSpawning;
+    int kernelUpdatePlayerSpawning;
 
     bool isInitialized = false;
 
+    //sets everything up
     public void Init() {
+        //load shaders + material
         _asteroidsShader = Resources.Load<ComputeShader>("asteroids");
         _drawLinesShader = Shader.Find("DrawLines");
         _drawLinesMaterial = new Material(_drawLinesShader);
         _drawLinesMaterial.hideFlags = HideFlags.HideAndDontSave;
 
+        //allocate loads of buffers
         _linesBuffer = ComputeBufferUtils.Alloc<Line>(LINE_BUFFER_SIZE);
         _charactersBuffer = ComputeBufferUtils.Alloc<Character>(CHARACTER_BUFFER_SIZE);
         _globalsBuffer = ComputeBufferUtils.Alloc<Globals>(1);
@@ -129,8 +141,8 @@ public class Game : MonoBehaviour
         _soundRequestBuffer = ComputeBufferUtils.Alloc<SoundRequest>(MAX_SOUND_REQUESTS);
         _fontBuffer = ComputeBufferUtils.Alloc<Line>(LINES_PER_CHARACTER * 256);
 
+        //find all kernels
         kernelBeginFrame = _asteroidsShader.FindKernel("BeginFrame");
-        kernelGenerateTestLines = _asteroidsShader.FindKernel("GenerateTestLines");
         kernelDrawDispatchArgs = _asteroidsShader.FindKernel("DrawDispatchArgs");
         kernelUpdateAndDrawPlayer = _asteroidsShader.FindKernel("UpdateAndDrawPlayer");
         kernelUpdateAndDrawAsteroid = _asteroidsShader.FindKernel("UpdateAndDrawAsteroid");
@@ -138,22 +150,25 @@ public class Game : MonoBehaviour
         kernelCollidePlayerAsteroid = _asteroidsShader.FindKernel("CollidePlayerAsteroid");
         kernelCollideBulletAsteroid = _asteroidsShader.FindKernel("CollideBulletAsteroid");
         kernelBuildFont = _asteroidsShader.FindKernel("BuildFont");
-        kernelDrawFont = _asteroidsShader.FindKernel("DrawFont");
         kernelUpdateGame = _asteroidsShader.FindKernel("UpdateGame");
         kernelSetupDispatch = _asteroidsShader.FindKernel("SetupDispatch");
         kernelSpawnAsteroids = _asteroidsShader.FindKernel("SpawnAsteroids");
         kernelClearAsteroids = _asteroidsShader.FindKernel("ClearAsteroids");
+        kernelPreparePlayerSpawning = _asteroidsShader.FindKernel("PreparePlayerSpawning");
+        kernelUpdatePlayerSpawning = _asteroidsShader.FindKernel("UpdatePlayerSpawning");
 
-        isInitialized = true;
-
+        //setup cpu side arrays
         _cpuKeyStates = new KeyState[256];
         _cpuSoundRequests = new SoundRequest[MAX_SOUND_REQUESTS];
         _cpuGlobals = new Globals[1];
 
-        _cpuGlobals[0].nextAsteroid = START_ASTEROIDS;
+        //clear globals buffer (probably unnecessary)
         _globalsBuffer.SetData(_cpuGlobals);
 
+        //load audio clips
         LoadClips("fire", "explode", "blop");
+
+        isInitialized = true;
     }
 
     //array of clips + list of allocated audio sources
@@ -184,22 +199,31 @@ public class Game : MonoBehaviour
        
     }
 
+    //fires off the 'build font' shader that fills in writable version of fonts buffer
     void BuildFont() {
         _asteroidsShader.SetBuffer(kernelBuildFont, "_fontRW", _fontBuffer);
         DispatchOne(kernelBuildFont);
     }
 
+    //bind all + dispatch 1 thread group of a kernel
     void DispatchOne(int kernel) {
         BindEverything(kernel);
         _asteroidsShader.Dispatch(kernel, 1, 1, 1);
     }
-    void DispatchItems(int kernel, int items) {
+
+    //bind all then work out / dispatch thread groups required to fire off a certain 
+    //number of threads. Also sets the '_threadCount' uniform, so compute side can know
+    //exactly how many threads were wanted
+    void DispatchThreads(int kernel, int thread_count) {
         uint x,y,z;
         BindEverything(kernel);
         _asteroidsShader.GetKernelThreadGroupSizes(kernel, out x, out y, out z);
-        _asteroidsShader.SetInt("_threadCount", items);
-        _asteroidsShader.Dispatch(kernel, (items + (int)x - 1) / (int)x, 1, 1);
+        _asteroidsShader.SetInt("_threadCount", thread_count);
+        _asteroidsShader.Dispatch(kernel, (thread_count + (int)x - 1) / (int)x, 1, 1);
     }
+
+    //dispatches the 'setup dispatch' shader to configer the dispatch args for a given
+    //dispatch type, then does an actual dispatch indirect on the requested kernel
     void DispatchIndirect(int kernel, int dispatchIndex) {
         _asteroidsShader.SetInt("_kernelIdRequested", dispatchIndex);
         DispatchOne(kernelSetupDispatch);
@@ -209,6 +233,7 @@ public class Game : MonoBehaviour
         _asteroidsShader.DispatchIndirect(kernel, _dispatchBuffer);
     }
 
+    //binds all the uniforms and buffers we could possibly need
     void BindEverything(int kernel) {
         _asteroidsShader.SetInt("_maxBullets", MAX_BULLETS);
         _asteroidsShader.SetInt("_maxPlayers", MAX_PLAYERS);
@@ -230,10 +255,8 @@ public class Game : MonoBehaviour
         _asteroidsShader.SetBuffer(kernel, "_font", _fontBuffer);
     }
 
-    private void Update() {
-        if (!isInitialized)
-            Init();
-        
+    //dumbly reads a load of key states into cpu side buffer, then writes them into compute buffer
+    void ReadInputs() {
         //read and store all key states
         for (int i = 0; i < 26; i++) {
             _cpuKeyStates['a' + i] = new KeyState {
@@ -259,33 +282,52 @@ public class Game : MonoBehaviour
             pressed = Input.GetKeyDown(KeyCode.Escape) ? 1 : 0,
             released = Input.GetKeyUp(KeyCode.Escape) ? 1 : 0,
         };
-
         _keyStates.SetData(_cpuKeyStates);
+    }
 
-        BuildFont();
-
-        DispatchOne(kernelBeginFrame);
-        DispatchOne(kernelUpdateGame);
-        DispatchIndirect(kernelClearAsteroids, KID_CLEAR_ASTEROIDS);
-        DispatchIndirect(kernelSpawnAsteroids, KID_SPAWN_ASTEROIDS);
-        DispatchItems(kernelUpdateAndDrawPlayer, MAX_PLAYERS);
-        DispatchItems(kernelUpdateAndDrawAsteroid, MAX_ASTEROIDS);
-        DispatchItems(kernelUpdateAndDrawBullet, MAX_ASTEROIDS);
-        DispatchItems(kernelCollidePlayerAsteroid, MAX_PLAYERS * MAX_ASTEROIDS);
-        DispatchItems(kernelCollideBulletAsteroid, MAX_BULLETS * MAX_ASTEROIDS);
-        DispatchOne(kernelDrawDispatchArgs);
-
+    //reads audio playback requests and plays them
+    void OutputSounds() {
         _soundRequestBuffer.GetData(_cpuSoundRequests);
         _globalsBuffer.GetData(_cpuGlobals);
         for (int i = 0; i < _cpuGlobals[0].numSoundRequests; i++)
             PlayClip(_cpuSoundRequests[i].id);
-
     }
 
+    //reads inputs, does a load of dispatches, generates draw args and fires off sounds
+    private void Update() {
+        if (!isInitialized)
+            Init();
+
+        ReadInputs();
+
+        BuildFont();
+
+        PlayerState[] players = new PlayerState[1];
+
+        DispatchOne(kernelBeginFrame);
+        DispatchOne(kernelUpdateGame);
+        _playerState.GetData(players);
+        DispatchIndirect(kernelClearAsteroids, KID_CLEAR_ASTEROIDS);
+        DispatchIndirect(kernelSpawnAsteroids, KID_SPAWN_ASTEROIDS);
+        _playerState.GetData(players);
+        DispatchThreads(kernelPreparePlayerSpawning, MAX_PLAYERS);
+        _playerState.GetData(players);
+        DispatchThreads(kernelUpdatePlayerSpawning, MAX_PLAYERS * MAX_ASTEROIDS);
+        _playerState.GetData(players);
+        DispatchThreads(kernelUpdateAndDrawPlayer, MAX_PLAYERS);
+        DispatchThreads(kernelUpdateAndDrawAsteroid, MAX_ASTEROIDS);
+        DispatchThreads(kernelUpdateAndDrawBullet, MAX_ASTEROIDS);
+        DispatchThreads(kernelCollidePlayerAsteroid, MAX_PLAYERS * MAX_ASTEROIDS);
+        DispatchThreads(kernelCollideBulletAsteroid, MAX_BULLETS * MAX_ASTEROIDS);
+        DispatchOne(kernelDrawDispatchArgs);
+
+        OutputSounds();
+    }
+
+    //uses draw args built during update to fire DrawProceduralIndirect calls that draw lines / text
     public void OnPostRender() {
         uint[] dpargs = new uint[8];
         _dispatchBuffer.GetData(dpargs);
-
 
         _drawLinesMaterial.SetBuffer("lines", _linesBuffer);
         _drawLinesMaterial.SetPass(0);
