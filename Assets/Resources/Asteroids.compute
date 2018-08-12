@@ -1,22 +1,40 @@
 ﻿#pragma kernel BeginFrame
 #pragma kernel GenerateTestLines
-#pragma kernel LineDispatchArgs
+#pragma kernel DrawDispatchArgs
 #pragma kernel UpdateAndDrawPlayer
 #pragma kernel UpdateAndDrawAsteroid
 #pragma kernel UpdateAndDrawBullet
 #pragma kernel CollidePlayerAsteroid
 #pragma kernel CollideBulletAsteroid
+#pragma kernel BuildFont
+#pragma kernel DrawFont
+#pragma kernel UpdateGame
+#pragma kernel SetupDispatch
+#pragma kernel ClearAsteroids
+#pragma kernel SpawnAsteroids
 
 //structures
 struct Line {
     float2 a;
     float2 b;
 };
-struct Counters {
+struct Character {
+    float2 pos;
+    float2 scl;
+    int id;
+};
+
+struct Globals {
     int numLines;
+    int numCharacters;
+
     int nextBullet;
     int nextAsteroid;
     int numSoundRequests;
+    int gameMode;
+
+    int requestClearAsteroids;
+    int requestSpawnAsteroids;
 };
 struct KeyState {
     int down;
@@ -28,6 +46,7 @@ struct PlayerState {
     float rotation;
     float2 velocity;
     int alive;
+    int waitingToSpawn;
 };
 struct AsteroidState {
     float2 position;
@@ -46,14 +65,27 @@ struct SoundRequest {
     int id;
 };
 
+#include "Font.cginc"
+
+//matching ids of sounds loaded in game.cs
+#define SND_FIRE 0
+#define SND_EXPLODE 1
+#define SND_BLOB 2
+
 //special key codes (that aren't just ascii codes)
-const int KEY_ESCAPE = 0;
+#define KEY_ESCAPE 0
+
+//kernel ids for indirect dispatching
+#define KID_SPAWN_ASTEROIDS 0
+#define KID_CLEAR_ASTEROIDS 1
 
 //buffers
 RWStructuredBuffer<Line> _linesRW;
-RWStructuredBuffer<Counters> _counters;
+RWStructuredBuffer<Character> _charactersRW;
+RWStructuredBuffer<Globals> _globals;
 RWStructuredBuffer<uint> _dispatch;
 StructuredBuffer<KeyState> _keyStates;
+StructuredBuffer<Line> _font;
 RWStructuredBuffer<PlayerState> _playersRW;
 RWStructuredBuffer<AsteroidState> _asteroidsRW;
 RWStructuredBuffer<BulletState> _bulletsRW;
@@ -73,12 +105,16 @@ int _maxAsteroids;
 int _maxPlayers;
 int _maxSoundRequests;
 
+//used by dispatch setup
+int _kernelIdRequested;
+
 //single dispatch to reset line counter
 [numthreads(1,1,1)]
 void BeginFrame(uint3 id : SV_DispatchThreadID)
 {
-    _counters[0].numLines = 0;
-    _counters[0].numSoundRequests = 0;
+    _globals[0].numLines = 0;
+    _globals[0].numCharacters = 0;
+    _globals[0].numSoundRequests = 0;
 }
 
 //creates lines based on dispatch thread
@@ -89,7 +125,7 @@ void GenerateTestLines(uint3 id : SV_DispatchThreadID)
     {
         //allocate space
         int lineIdx;
-        InterlockedAdd(_counters[0].numLines, 1, lineIdx);
+        InterlockedAdd(_globals[0].numLines, 1, lineIdx);
 
         //build line
         Line l;
@@ -103,17 +139,22 @@ void GenerateTestLines(uint3 id : SV_DispatchThreadID)
 
 //fills out indirect dispatch args 
 [numthreads(1, 1, 1)]
-void LineDispatchArgs(uint3 id : SV_DispatchThreadID)
+void DrawDispatchArgs(uint3 id : SV_DispatchThreadID)
 {
-    _dispatch[0] = _counters[0].numLines*2; //v count per inst (2 verts per line)
+    _dispatch[0] = _globals[0].numLines*2; //v count per inst (2 verts per line)
     _dispatch[1] = 1; //1 instance
     _dispatch[2] = 0; //verts start at 0
     _dispatch[3] = 0; //instances start at 0
+
+    _dispatch[4] = _globals[0].numCharacters * 2 * LINES_PER_CHARACTER; //v count per inst (2 verts per line per character)
+    _dispatch[5] = 1; //1 instance
+    _dispatch[6] = 0; //verts start at 0
+    _dispatch[7] = 0; //instances start at 0
 }
 
 int AllocLines(int count) {
     int lineIdx;
-    InterlockedAdd(_counters[0].numLines, count, lineIdx);
+    InterlockedAdd(_globals[0].numLines, count, lineIdx);
     return lineIdx;
 }
 void AddLine(int idx, float2 a, float2 b) {
@@ -121,9 +162,9 @@ void AddLine(int idx, float2 a, float2 b) {
     _linesRW[idx].b = b;
 }
 
-void RequestSound(int id) {
+void PlaySound(int id) {
     int idx;
-    InterlockedAdd(_counters[0].numSoundRequests, 1, idx);
+    InterlockedAdd(_globals[0].numSoundRequests, 1, idx);
     if (idx < _maxSoundRequests) {
         _soundRequestsRW[idx].id = id;
     }
@@ -178,7 +219,7 @@ void UpdateAndDrawPlayer(uint3 id : SV_DispatchThreadID)
         if(player.alive) {
             float rot = 0;
             float thrust = 0;
-            float rotPerSecond = 5;
+            float rotPerSecond = 3.5;
             float thrustPerSecond = 150;
 
             if (_keyStates['a'].down) {
@@ -209,12 +250,13 @@ void UpdateAndDrawPlayer(uint3 id : SV_DispatchThreadID)
 
             if (_keyStates[' '].pressed) {
                 int nextBullet;
-                InterlockedAdd(_counters[0].nextBullet, 1, nextBullet);
+                InterlockedAdd(_globals[0].nextBullet, 1, nextBullet);
                 BulletState b;
                 b.position = player.position;
                 b.velocity = worldy * 1000;
                 b.lifetime = 3;
                 _bulletsRW[nextBullet%_maxBullets] = b;
+                PlaySound(SND_FIRE);
             }
 
 
@@ -371,8 +413,11 @@ void UpdateAndDrawBullet(uint3 id : SV_DispatchThreadID)
 
 void SplitAsteroid(int idx) {
     int nextIndex;
-    InterlockedAdd(_counters[0].nextAsteroid, 2, nextIndex);
+    InterlockedAdd(_globals[0].nextAsteroid, 2, nextIndex);
+    nextIndex = nextIndex % _maxAsteroids;
 
+    PlaySound(SND_EXPLODE);
+    
     AsteroidState asteroid = _asteroidsRW[idx];
     if (asteroid.level < 2) {
 
@@ -386,6 +431,7 @@ void SplitAsteroid(int idx) {
         child.rotation = (wang_rand(nextIndex * 3) * 2 - 1) * 3.1415927f;
         child.level = asteroid.level + 1;
         _asteroidsRW[nextIndex++] = child;
+        nextIndex = nextIndex % _maxAsteroids;
 
         child.position = asteroid.position;
         child.velocity = asteroid.velocity + (float2(wang_rand(nextIndex), wang_rand(nextIndex * 2)) * 2 - 1) * childSpeed;
@@ -394,6 +440,7 @@ void SplitAsteroid(int idx) {
         child.rotation = (wang_rand(nextIndex * 3) * 2 - 1) * 3.1415927f;
         child.level = asteroid.level + 1;
         _asteroidsRW[nextIndex++] = child;
+        nextIndex = nextIndex % _maxAsteroids;
     }
 
 
@@ -414,7 +461,7 @@ void CollidePlayerAsteroid(uint3 id : SV_DispatchThreadID)
         if (player.alive && asteroid.alive) {
             if (length(player.position - asteroid.position) < (asteroid.radius+10)) {
                 _playersRW[playerIdx].alive = 0;
-                _asteroidsRW[asteroidIdx].alive = 0;
+                SplitAsteroid(asteroidIdx);
             }
         }
     }
@@ -439,3 +486,182 @@ void CollideBulletAsteroid(uint3 id : SV_DispatchThreadID)
         }
     }
 }
+
+//expected to dispatch 1 group, resulting in 256 calls, 1 for each potential ascii character
+[numthreads(256, 1, 1)]
+void BuildFont(uint3 id : SV_DispatchThreadID)
+{
+    BuildCharacter(id.x);
+}
+[numthreads(256, 1, 1)]
+void DrawFont(uint3 id : SV_DispatchThreadID)
+{
+    int lineIdx = AllocLines(LINES_PER_CHARACTER);
+    int charOffset = id.x * LINES_PER_CHARACTER;
+
+    float2 pos = float2(id.x / 16, id.x % 16) * float2(20,25) + 100;
+    float2 scl = float2(15,20);
+
+    for (int i = 0; i < LINES_PER_CHARACTER; i++) {
+        float2 a = _font[charOffset + i].a * scl + pos;
+        float2 b = _font[charOffset + i].b * scl + pos;
+        AddLine(lineIdx++, a, b);
+    }
+}
+
+int AllocCharacters(int count) {
+    int idx;
+    InterlockedAdd(_globals[0].numCharacters, count, idx);
+    return idx;
+}
+void DrawCharacter(int idx, int code, float2 pos, float2 scl) {
+    Character c;
+    c.id = code;
+    c.pos = pos;
+    c.scl = scl;
+    _charactersRW[idx] = c;
+}
+
+void DrawText_OneCoinOnePlay() {
+    float2 pos = float2(350,150);
+    float2 scl = float2(18, 20);
+    float2 spacing = float2(scl.x*1.25, 0);
+
+    int idx = AllocCharacters(13);
+    DrawCharacter(idx++, '1', pos, scl); pos += spacing;
+    DrawCharacter(idx++, ' ', pos, scl); pos += spacing;
+    DrawCharacter(idx++, 'C', pos, scl); pos += spacing;
+    DrawCharacter(idx++, 'O', pos, scl); pos += spacing;
+    DrawCharacter(idx++, 'I', pos, scl); pos += spacing;
+    DrawCharacter(idx++, 'N', pos, scl); pos += spacing;
+    DrawCharacter(idx++, ' ', pos, scl); pos += spacing;
+    DrawCharacter(idx++, '1', pos, scl); pos += spacing;
+    DrawCharacter(idx++, ' ', pos, scl); pos += spacing;
+    DrawCharacter(idx++, 'P', pos, scl); pos += spacing;
+    DrawCharacter(idx++, 'L', pos, scl); pos += spacing;
+    DrawCharacter(idx++, 'A', pos, scl); pos += spacing;
+    DrawCharacter(idx++, 'Y', pos, scl); pos += spacing;
+}
+
+void DrawNumberTimes10(int number, float2 pos, float2 scl, bool pad) {
+    float2 spacing = float2(scl.x*1.25, 0);
+
+    int idx = AllocCharacters(8);
+
+    bool onFirstChar = true;
+    for (int base = 1000000; base > 0; base /= 10) {
+        int val = clamp(number / base,0,9);
+        number -= val * base;
+        if (val != 0 || !onFirstChar || base==1) {
+            //output character
+            DrawCharacter(idx++, '0'+val, pos, scl); pos += spacing;
+            onFirstChar = false;
+        }
+        else {
+            //output space and increment pos if padding requested
+            DrawCharacter(idx++, ' ', pos, scl);
+            if(pad)
+                pos += spacing;
+        }
+    }
+
+    //final 0
+    DrawCharacter(idx++, '0', pos, scl); pos += spacing;
+}
+
+[numthreads(1,1,1)]
+void SetupDispatch(uint3 id: SV_DispatchThreadID)
+{
+    switch (_kernelIdRequested) {
+    case KID_CLEAR_ASTEROIDS: {
+        _dispatch[0] =  _globals[0].requestClearAsteroids ? (_maxAsteroids+255)/256 : 0;
+        break;
+    }
+    case KID_SPAWN_ASTEROIDS: {
+        _dispatch[0] = (_globals[0].requestSpawnAsteroids + 255) / 256;
+        break;
+    }
+    default: {
+        _dispatch[0] = 0; 
+        break;
+    }
+    }
+    _dispatch[1] = 1;
+    _dispatch[2] = 1;
+}
+
+[numthreads(1,1,1)]
+void UpdateGame(uint3 id : SV_DispatchThreadID)
+{
+    DrawNumberTimes10(0, float2(100, 700), float2(18, 20), true);
+    DrawNumberTimes10(0, float2(800, 700), float2(18, 20), false);
+    DrawNumberTimes10(0, float2(500, 680), float2(18, 20)*0.75, false);
+
+    int gameMode = _globals[0].gameMode;
+    if (gameMode == 0) {
+        //on init, ask for 8 asteroids to move around in the background
+        gameMode = 1;
+        _globals[0].requestSpawnAsteroids = 8;
+    }
+    else if (gameMode == 1)
+    { 
+        //main menu
+        DrawText_OneCoinOnePlay();
+
+        //when 'c' is pressed, ask to clear and then spawn 4 new asteroids
+        if (_keyStates['c'].pressed) {
+            _globals[0].requestClearAsteroids = true;
+            _globals[0].requestSpawnAsteroids = 4;
+            gameMode = 2;
+        }
+    }
+    _globals[0].gameMode = gameMode;
+}
+
+[numthreads(256, 1, 1)]
+void ClearAsteroids(uint3 id : SV_DispatchThreadID) {
+    _globals[0].requestClearAsteroids = 0;
+    _globals[0].nextAsteroid = 0;
+    if (id.x < _maxAsteroids)
+    {
+        _asteroidsRW[id.x].alive = 0;
+    }
+}
+
+[numthreads(256,1,1)] 
+void SpawnAsteroids(uint3 id : SV_DispatchThreadID) {
+    int maxCount = _threadCount < 0 ? _globals[0].requestSpawnAsteroids : _threadCount;
+    _globals[0].requestSpawnAsteroids = 0;
+    if (id.x < maxCount)
+    { 
+        int nextIndex;
+        InterlockedAdd(_globals[0].nextAsteroid, 1, nextIndex);
+        nextIndex = nextIndex % _maxAsteroids;
+
+        AsteroidState asteroid;
+
+        uint hash = wang_hash(id.x + _frame + 128312631);
+
+        uint xhash = wang_hash(hash);
+        uint yhash = wang_hash(xhash);
+
+        float x = (xhash % 1024);
+        float y = (yhash % 768);
+
+        asteroid.position = float2(x, y);
+
+        uint xvelhash = wang_hash(yhash);
+        uint yvelhash = wang_hash(xvelhash);
+
+        float xvel = (xvelhash % 100)-50.0f;
+        float yvel = (yvelhash % 100)-50.0f;
+
+        asteroid.velocity = float2(xvel, yvel);
+        asteroid.alive = 1;
+        asteroid.radius = 30.0f;
+        asteroid.rotation = radians(wang_hash(yvelhash) % 360);
+        asteroid.level = 0;
+        _asteroidsRW[nextIndex] = asteroid;
+    }
+}
+

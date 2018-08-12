@@ -1,5 +1,6 @@
 ﻿using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -13,11 +14,22 @@ public class Game : MonoBehaviour
             return string.Format("[{0},{1}]->[{2},{3}], ang {4}", a.x, a.y, b.x, b.y, Mathf.Atan2(b.y-a.y,b.x-a.x)*Mathf.Rad2Deg);
         }
     }
-    public struct Counters {
+    public struct Character {
+        public Vector2 pos;
+        public Vector2 scl;
+        public int id;
+    }
+    public struct Globals {
         public int numLines;
+        public int numCharacters;
+
         public int nextBullet;
         public int nextAsteroid;
         public int numSoundRequests;
+        public int gameMode;
+
+        public int requestClearAsteroids;
+        public int requestSpawnAsteroids;
     }
     public struct KeyState {
         public int down;
@@ -29,6 +41,7 @@ public class Game : MonoBehaviour
         public float rotation;
         public Vector2 velocity;
         public int alive;
+        public int waitingToSpawn;
     }
     public struct AsteroidState {
         public Vector2 position;
@@ -48,46 +61,54 @@ public class Game : MonoBehaviour
     }
 
     public const int LINE_BUFFER_SIZE = 10000;
+    public const int CHARACTER_BUFFER_SIZE = 10000;
     public const int MAX_PLAYERS = 1;
     public const int MAX_ASTEROIDS = 100;
     public const int MAX_BULLETS = 100;
     public const int START_ASTEROIDS = 4;
     public const int MAX_SOUND_REQUESTS = 20;
+    public const int LINES_PER_CHARACTER = 16;
 
-    public const int SOUND_FIRE = 0;
-    public const int SOUND_EXPLODE = 1;
-    public const int SOUND_BLOP = 2;
-    public const int NUM_SOUNDS = 3;
+    public const int KID_SPAWN_ASTEROIDS = 0;
+    public const int KID_CLEAR_ASTEROIDS = 1;
 
-    AudioSource[] _audioSources;
+    //AudioSource[] _audioSources;
 
     ComputeShader _asteroidsShader;
     Shader _drawLinesShader;
     Material _drawLinesMaterial;
 
     ComputeBuffer _linesBuffer;
-    ComputeBuffer _countersBuffer;
+    ComputeBuffer _charactersBuffer;
+    ComputeBuffer _globalsBuffer;
     ComputeBuffer _dispatchBuffer;
     ComputeBuffer _keyStates;
     ComputeBuffer _playerState;
     ComputeBuffer _asteroidState;
     ComputeBuffer _bulletState;
     ComputeBuffer _soundRequestBuffer;
+    ComputeBuffer _fontBuffer;
 
     KeyState[] _cpuKeyStates;
     SoundRequest[] _cpuSoundRequests;
-    Counters[] _cpuCounters;
+    Globals[] _cpuGlobals;
 
     const int KEY_ESCAPE = 0;
 
     int kernelBeginFrame;
     int kernelGenerateTestLines;
-    int kernelLineDispatchArgs;
+    int kernelDrawDispatchArgs;
     int kernelUpdateAndDrawPlayer;
     int kernelUpdateAndDrawAsteroid;
     int kernelUpdateAndDrawBullet;
     int kernelCollidePlayerAsteroid;
     int kernelCollideBulletAsteroid;
+    int kernelBuildFont;
+    int kernelDrawFont;
+    int kernelUpdateGame;
+    int kernelSetupDispatch;
+    int kernelSpawnAsteroids;
+    int kernelClearAsteroids;
 
     bool isInitialized = false;
 
@@ -98,59 +119,74 @@ public class Game : MonoBehaviour
         _drawLinesMaterial.hideFlags = HideFlags.HideAndDontSave;
 
         _linesBuffer = ComputeBufferUtils.Alloc<Line>(LINE_BUFFER_SIZE);
-        _countersBuffer = ComputeBufferUtils.Alloc<Counters>(1);
-        _dispatchBuffer = ComputeBufferUtils.Alloc<uint>(8, ComputeBufferType.IndirectArguments);
+        _charactersBuffer = ComputeBufferUtils.Alloc<Character>(CHARACTER_BUFFER_SIZE);
+        _globalsBuffer = ComputeBufferUtils.Alloc<Globals>(1);
+        _dispatchBuffer = ComputeBufferUtils.Alloc<uint>(1024, ComputeBufferType.IndirectArguments);
         _keyStates = ComputeBufferUtils.Alloc<KeyState>(256);
         _playerState = ComputeBufferUtils.Alloc<PlayerState>(MAX_PLAYERS);
         _asteroidState = ComputeBufferUtils.Alloc<AsteroidState>(MAX_ASTEROIDS);
         _bulletState = ComputeBufferUtils.Alloc<BulletState>(MAX_BULLETS);
         _soundRequestBuffer = ComputeBufferUtils.Alloc<SoundRequest>(MAX_SOUND_REQUESTS);
+        _fontBuffer = ComputeBufferUtils.Alloc<Line>(LINES_PER_CHARACTER * 256);
 
         kernelBeginFrame = _asteroidsShader.FindKernel("BeginFrame");
         kernelGenerateTestLines = _asteroidsShader.FindKernel("GenerateTestLines");
-        kernelLineDispatchArgs = _asteroidsShader.FindKernel("LineDispatchArgs");
+        kernelDrawDispatchArgs = _asteroidsShader.FindKernel("DrawDispatchArgs");
         kernelUpdateAndDrawPlayer = _asteroidsShader.FindKernel("UpdateAndDrawPlayer");
         kernelUpdateAndDrawAsteroid = _asteroidsShader.FindKernel("UpdateAndDrawAsteroid");
         kernelUpdateAndDrawBullet = _asteroidsShader.FindKernel("UpdateAndDrawBullet");
         kernelCollidePlayerAsteroid = _asteroidsShader.FindKernel("CollidePlayerAsteroid");
         kernelCollideBulletAsteroid = _asteroidsShader.FindKernel("CollideBulletAsteroid");
+        kernelBuildFont = _asteroidsShader.FindKernel("BuildFont");
+        kernelDrawFont = _asteroidsShader.FindKernel("DrawFont");
+        kernelUpdateGame = _asteroidsShader.FindKernel("UpdateGame");
+        kernelSetupDispatch = _asteroidsShader.FindKernel("SetupDispatch");
+        kernelSpawnAsteroids = _asteroidsShader.FindKernel("SpawnAsteroids");
+        kernelClearAsteroids = _asteroidsShader.FindKernel("ClearAsteroids");
 
         isInitialized = true;
 
         _cpuKeyStates = new KeyState[256];
         _cpuSoundRequests = new SoundRequest[MAX_SOUND_REQUESTS];
+        _cpuGlobals = new Globals[1];
 
-        PlayerState[] initPlayer = new PlayerState[MAX_PLAYERS];
-        initPlayer[0].position = new Vector2(1024f, 768f) * 0.5f;
-        initPlayer[0].alive = 1;
-        _playerState.SetData(initPlayer);
+        _cpuGlobals[0].nextAsteroid = START_ASTEROIDS;
+        _globalsBuffer.SetData(_cpuGlobals);
 
-        AsteroidState[] initAsteroids = new AsteroidState[MAX_ASTEROIDS];
-        for(int i = 0; i < START_ASTEROIDS; i++) {
-            while(true) {
-                initAsteroids[i].position = new Vector2(Random.Range(0f, 1024f), Random.Range(0f, 768f));
-                if ((initAsteroids[i].position - initPlayer[0].position).magnitude > 200f)
-                    break;
+        LoadClips("fire", "explode", "blop");
+    }
+
+    //array of clips + list of allocated audio sources
+    AudioClip[] _clips;
+    List<AudioSource> _audioSources;
+
+    //load list of clips
+    void LoadClips(params string[] names) {
+        _audioSources = new List<AudioSource>();
+        _clips = names.Select(a => Resources.Load<AudioClip>(a)).ToArray();
+    }
+
+    //find a free audio source, allocating if necessary, and play clip
+    void PlayClip(int idx) {
+        AudioSource src = null;
+        for(int i = 0; i < _audioSources.Count; i++) {
+            if(!_audioSources[i].isPlaying) {
+                src = _audioSources[i];
+                break;
             }
-            initAsteroids[i].alive = 1;
-            initAsteroids[i].radius = 30;
-            initAsteroids[i].rotation = Random.Range(-Mathf.PI, Mathf.PI);
-            initAsteroids[i].velocity = Random.insideUnitCircle * 50f;
-            initAsteroids[i].level = 0;
         }
-        _asteroidState.SetData(initAsteroids);
+        if (!src) {
+            src = gameObject.AddComponent<AudioSource>();
+            _audioSources.Add(src);
+        }
+        src.clip = _clips[idx];
+        src.Play();
+       
+    }
 
-        Counters[] initCounters = new Counters[1];
-        initCounters[0].nextAsteroid = START_ASTEROIDS;
-        _countersBuffer.SetData(initCounters);
-
-        _audioSources = new AudioSource[NUM_SOUNDS];
-        _audioSources[SOUND_FIRE] = gameObject.AddComponent<AudioSource>();
-        _audioSources[SOUND_FIRE].clip = Resources.Load<AudioClip>("fire");
-        _audioSources[SOUND_EXPLODE] = gameObject.AddComponent<AudioSource>();
-        _audioSources[SOUND_EXPLODE].clip = Resources.Load<AudioClip>("explode");
-        _audioSources[SOUND_BLOP] = gameObject.AddComponent<AudioSource>();
-        _audioSources[SOUND_BLOP].clip = Resources.Load<AudioClip>("blop");
+    void BuildFont() {
+        _asteroidsShader.SetBuffer(kernelBuildFont, "_fontRW", _fontBuffer);
+        DispatchOne(kernelBuildFont);
     }
 
     void DispatchOne(int kernel) {
@@ -164,6 +200,14 @@ public class Game : MonoBehaviour
         _asteroidsShader.SetInt("_threadCount", items);
         _asteroidsShader.Dispatch(kernel, (items + (int)x - 1) / (int)x, 1, 1);
     }
+    void DispatchIndirect(int kernel, int dispatchIndex) {
+        _asteroidsShader.SetInt("_kernelIdRequested", dispatchIndex);
+        DispatchOne(kernelSetupDispatch);
+
+        BindEverything(kernel);
+        _asteroidsShader.SetInt("_threadCount", -1);
+        _asteroidsShader.DispatchIndirect(kernel, _dispatchBuffer);
+    }
 
     void BindEverything(int kernel) {
         _asteroidsShader.SetInt("_maxBullets", MAX_BULLETS);
@@ -175,19 +219,21 @@ public class Game : MonoBehaviour
         _asteroidsShader.SetInt("_frame", Time.frameCount);
 
         _asteroidsShader.SetBuffer(kernel, "_dispatch", _dispatchBuffer);
-        _asteroidsShader.SetBuffer(kernel, "_counters", _countersBuffer);
+        _asteroidsShader.SetBuffer(kernel, "_globals", _globalsBuffer);
         _asteroidsShader.SetBuffer(kernel, "_linesRW", _linesBuffer);
+        _asteroidsShader.SetBuffer(kernel, "_charactersRW", _charactersBuffer);
         _asteroidsShader.SetBuffer(kernel, "_keyStates", _keyStates);
         _asteroidsShader.SetBuffer(kernel, "_playersRW", _playerState);
         _asteroidsShader.SetBuffer(kernel, "_bulletsRW", _bulletState);
         _asteroidsShader.SetBuffer(kernel, "_asteroidsRW", _asteroidState);
         _asteroidsShader.SetBuffer(kernel, "_soundRequestsRW", _soundRequestBuffer);
+        _asteroidsShader.SetBuffer(kernel, "_font", _fontBuffer);
     }
 
     private void Update() {
         if (!isInitialized)
             Init();
-
+        
         //read and store all key states
         for (int i = 0; i < 26; i++) {
             _cpuKeyStates['a' + i] = new KeyState {
@@ -216,25 +262,38 @@ public class Game : MonoBehaviour
 
         _keyStates.SetData(_cpuKeyStates);
 
+        BuildFont();
+
         DispatchOne(kernelBeginFrame);
+        DispatchOne(kernelUpdateGame);
+        DispatchIndirect(kernelClearAsteroids, KID_CLEAR_ASTEROIDS);
+        DispatchIndirect(kernelSpawnAsteroids, KID_SPAWN_ASTEROIDS);
         DispatchItems(kernelUpdateAndDrawPlayer, MAX_PLAYERS);
         DispatchItems(kernelUpdateAndDrawAsteroid, MAX_ASTEROIDS);
         DispatchItems(kernelUpdateAndDrawBullet, MAX_ASTEROIDS);
         DispatchItems(kernelCollidePlayerAsteroid, MAX_PLAYERS * MAX_ASTEROIDS);
         DispatchItems(kernelCollideBulletAsteroid, MAX_BULLETS * MAX_ASTEROIDS);
-        DispatchOne(kernelLineDispatchArgs);
+        DispatchOne(kernelDrawDispatchArgs);
 
         _soundRequestBuffer.GetData(_cpuSoundRequests);
-        _countersBuffer.GetData(_cpuCounters);
-        for (int i = 0; i < _cpuCounters[0].numSoundRequests; i++)
-            _audioSources[_cpuSoundRequests[i].id].Play();
+        _globalsBuffer.GetData(_cpuGlobals);
+        for (int i = 0; i < _cpuGlobals[0].numSoundRequests; i++)
+            PlayClip(_cpuSoundRequests[i].id);
 
     }
 
     public void OnPostRender() {
+        uint[] dpargs = new uint[8];
+        _dispatchBuffer.GetData(dpargs);
+
 
         _drawLinesMaterial.SetBuffer("lines", _linesBuffer);
         _drawLinesMaterial.SetPass(0);
-        Graphics.DrawProceduralIndirect(MeshTopology.Lines, _dispatchBuffer);
+        Graphics.DrawProceduralIndirect(MeshTopology.Lines, _dispatchBuffer, 0);
+
+        _drawLinesMaterial.SetBuffer("lines", _fontBuffer);
+        _drawLinesMaterial.SetBuffer("characters", _charactersBuffer);
+        _drawLinesMaterial.SetPass(1);
+        Graphics.DrawProceduralIndirect(MeshTopology.Lines, _dispatchBuffer, 16);
     }
 }
