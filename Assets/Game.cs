@@ -306,14 +306,10 @@ public class Game : MonoBehaviour
 
         DispatchOne(kernelBeginFrame);
         DispatchOne(kernelUpdateGame);
-        _playerState.GetData(players);
         DispatchIndirect(kernelClearAsteroids, KID_CLEAR_ASTEROIDS);
         DispatchIndirect(kernelSpawnAsteroids, KID_SPAWN_ASTEROIDS);
-        _playerState.GetData(players);
         DispatchThreads(kernelPreparePlayerSpawning, MAX_PLAYERS);
-        _playerState.GetData(players);
         DispatchThreads(kernelUpdatePlayerSpawning, MAX_PLAYERS * MAX_ASTEROIDS);
-        _playerState.GetData(players);
         DispatchThreads(kernelUpdateAndDrawPlayer, MAX_PLAYERS);
         DispatchThreads(kernelUpdateAndDrawAsteroid, MAX_ASTEROIDS);
         DispatchThreads(kernelUpdateAndDrawBullet, MAX_ASTEROIDS);
